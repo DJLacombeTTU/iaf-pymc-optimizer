@@ -1,0 +1,15 @@
+# Python environment
+venv/
+__pycache__/
+*.pyc
+
+# IDE/Editor
+.vscode/
+.idea/
+.ipynb_checkpoints/
+
+# Data
+Data/*.csv
+
+# System
+.DS_Store
