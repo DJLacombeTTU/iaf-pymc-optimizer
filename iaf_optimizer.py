@@ -497,3 +497,16 @@ class IAFOptimizer:
         summary_df = summary_df.drop(columns=[col for col in columns_to_drop if col in summary_df.columns])
         
         return summary_df
+    
+import equinox as eqx
+
+def save(self, path: str):
+    """Saves the trained flow parameters to a file."""
+    eqx.tree_serialise_leaves(path, self.flow)
+    print(f"Model saved to {path}")
+
+def load(self, path: str):
+    """Loads the flow parameters from a file."""
+    # This assumes self.flow is already initialized with the same architecture
+    self.flow = eqx.tree_deserialise_leaves(path, self.flow)
+    print(f"Model loaded from {path}")

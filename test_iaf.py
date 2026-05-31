@@ -49,20 +49,20 @@ print("Initializing IAF Optimizer...")
 # We use a lightweight configuration since this posterior is highly Gaussian
 optimizer = IAFOptimizer(
     pymc_model=satisfaction_model,
-    depth=2,                  # Only 2 layers needed for a simple regression
+    depth=8,                  # Only 2 layers needed for a simple regression
     hidden_sizes=[64, 64],    # Small network 
-    num_components=8          # 8 mixture components is plenty here
+    num_components=8        # 8 mixture components is plenty here
 )
 
 print("Training Flow via ELBO Maximization...")
 # We can use a slightly aggressive learning rate for simple geometries
-optimizer.fit(learning_rate=0.01, num_steps=2000, batch_size=256)
+optimizer.fit(learning_rate=0.01, num_steps=3000, batch_size=256)
 
 # ==========================================
 # 4. Generate Inference Data and Verify
 # ==========================================
 print("\nSampling from optimized flow...")
-idata = optimizer.sample(num_samples=10000)
+idata = optimizer.sample(num_samples=2000)
 
 print("\n--- Parameter Recovery Results ---")
 summary_table = optimizer.summary(idata)
