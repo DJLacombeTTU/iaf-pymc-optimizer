@@ -6,6 +6,11 @@ import numpy as np
 import pandas as pd
 from arviz import psislw
 from typing import List, Tuple
+import optax
+import pymc as pm
+from pymc.sampling.jax import get_jaxified_logp
+import arviz as az
+from jax.tree_util import tree_map
 
 class MaskedDense(eqx.Module):
     """
@@ -17,17 +22,27 @@ class MaskedDense(eqx.Module):
     mask: jnp.ndarray
     has_bias: bool = eqx.field(static=True)
 
-    def __init__(self, in_features: int, out_features: int, mask: jnp.ndarray, has_bias: bool = True, *, key):
+    def __init__(self, in_features: int, out_features: int, mask: jnp.ndarray, has_bias: bool = True, zero_init: bool = False, *, key):
         wkey, bkey = jr.split(key)
         
-        # Standard Kaiming/Lecun hidden initialization
-        lim = 1.0 / jnp.sqrt(in_features)
-        self.weight = jr.uniform(wkey, (out_features, in_features), minval=-lim, maxval=lim)
-        
-        if has_bias:
-            self.bias = jr.uniform(bkey, (out_features,), minval=-lim, maxval=lim)
+        # --- IDENTITY INITIALIZATION ---
+        # If zero_init is True, initialize weights and biases to absolute zero.
+        # This ensures the flow starts as an exact Identity function (y=x).
+        if zero_init:
+            self.weight = jnp.zeros((out_features, in_features))
+            if has_bias:
+                self.bias = jnp.zeros((out_features,))
+            else:
+                self.bias = jnp.zeros((out_features,))
         else:
-            self.bias = jnp.zeros((out_features,))
+            # Standard Kaiming/Lecun hidden initialization
+            lim = 1.0 / jnp.sqrt(in_features)
+            self.weight = jr.uniform(wkey, (out_features, in_features), minval=-lim, maxval=lim)
+            
+            if has_bias:
+                self.bias = jr.uniform(bkey, (out_features,), minval=-lim, maxval=lim)
+            else:
+                self.bias = jnp.zeros((out_features,))
             
         self.mask = mask
         self.has_bias = has_bias
@@ -84,15 +99,16 @@ class AutoregressiveConditioner(eqx.Module):
         output_degrees = jnp.repeat(input_degrees, out_features_per_dim)
         
         # Mask criteria for output layer: output_node > hidden_node (Strictly Autoregressive)
+        # We pass zero_init=True to guarantee a safe start for the flow.
         final_mask = output_degrees[:, None] > current_deg[None, :]
-        layers.append(MaskedDense(in_features, out_features, final_mask, key=keys[-1]))
+        layers.append(MaskedDense(in_features, out_features, final_mask, zero_init=True, key=keys[-1]))
         
         self.layers = layers
 
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
         # Pass elements sequentially through the masked network hierarchy
         for layer in self.layers[:-1]:
-            x = jax.nn.elu(layer(x))
+            x = jax.nn.gelu(layer(x))  # GELU: Smoother manifold mapping
         
         # Final layer remains raw unconstrained logits/parameters
         return self.layers[-1](x)
@@ -166,6 +182,7 @@ class DeepSigmoidalBijector(eqx.Module):
         log_det = jnp.log(dy_du + eps) + jnp.log(du_dx + eps)
         
         return y, log_det
+
 class FlowLayer(eqx.Module):
     """
     A single layer of the Inverse Autoregressive Flow.
@@ -244,9 +261,6 @@ class InverseAutoregressiveFlow(eqx.Module):
             
         return z, log_q
     
-import pymc as pm
-from pymc.sampling.jax import get_jaxified_logp
-
 class PyMCTranspiler:
     """
     Bridges PyMC models to JAX for variational flow optimization.
@@ -295,34 +309,32 @@ class PyMCTranspiler:
         return jnp.array(logp_val, dtype=jnp.float64)    
     
 @eqx.filter_value_and_grad
-def compute_loss(flow: InverseAutoregressiveFlow, transpiler: PyMCTranspiler, key: jax.Array, num_samples: int) -> jnp.ndarray:
+def compute_loss(flow: InverseAutoregressiveFlow, transpiler: PyMCTranspiler, key: jax.Array, num_samples: int, iwae_k: int = 1) -> jnp.ndarray:
     """
-    Computes the negative Evidence Lower Bound (ELBO) for a batch of samples.
-    Decorated with @eqx.filter_value_and_grad to automatically compute gradients 
-    with respect to the flow's parameters, ignoring static fields.
+    Computes the Evidence Lower Bound (ELBO) or the Importance Weighted Autoencoder (IWAE) loss.
     """
-    # 1. Generate unique PRNG keys for the batch
     batch_keys = jax.random.split(key, num_samples)
-    
-    # 2. Vectorize the flow sampling across the batch dimension
-    # z_samples shape: [num_samples, D]
-    # log_q shape: [num_samples]
     z_samples, log_q = jax.vmap(flow.sample_and_log_prob)(batch_keys)
-    
-    # 3. Vectorize the PyMC target log-probability evaluation
-    # log_p shape: [num_samples]
     log_p = jax.vmap(transpiler.logp_flat)(z_samples)
     
-    # 4. Calculate the negative ELBO
-    # We want to maximize ELBO = E_q[log p(z) - log q(z)]
-    # So we minimize Loss = E_q[log q(z) - log p(z)]
-    loss = jnp.mean(log_q - log_p)
+    # Calculate the raw log importance weights
+    log_w = log_p - log_q
     
-    return loss    
-
-import optax
-import arviz as az
-from jax.tree_util import tree_map
+    if iwae_k > 1:
+        # --- IWAE Objective (Mass-Covering) ---
+        # Group samples into clusters of size k
+        num_batches = num_samples // iwae_k
+        log_w_grouped = log_w.reshape(num_batches, iwae_k)
+        
+        # IWAE Loss = -mean( log( 1/k * sum(exp(w)) ) )
+        # Using logsumexp for extreme numerical stability
+        log_iwae = jax.scipy.special.logsumexp(log_w_grouped, axis=-1) - jnp.log(iwae_k)
+        loss = -jnp.mean(log_iwae)
+    else:
+        # --- Standard ELBO (Mode-Seeking) ---
+        loss = -jnp.mean(log_w)
+    
+    return loss
 
 class IAFOptimizer:
     """
@@ -349,25 +361,45 @@ class IAFOptimizer:
         self.num_devices = jax.local_device_count()
         print(f"Initialized IAFOptimizer across {self.num_devices} device(s). Parameter space: {self.transpiler.total_dim} dimensions.")
 
-    def fit(self, learning_rate: float = 0.005, num_steps: int = 1000, batch_size: int = 256):
+    def fit(self, learning_rate: float = 0.005, num_steps: int = 1000, batch_size: int = 256, weight_decay: float = 1e-4, iwae_k: int = 1, callback=None):
         """
-        Maximizes the ELBO to train the autoregressive flow using distributed computing.
+        Maximizes the ELBO or IWAE to train the autoregressive flow using distributed computing.
         """
         # Ensure batch size divides evenly across available physical hardware
         if batch_size % self.num_devices != 0:
             batch_size = (batch_size // self.num_devices) * self.num_devices
         batch_per_device = batch_size // self.num_devices
         
-        # Initialize Optax Adam optimizer
-        optimizer = optax.adam(learning_rate)
+        # Ensure batch_per_device is cleanly divisible by iwae_k for clustering
+        if batch_per_device % iwae_k != 0:
+            raise ValueError(f"Hardware batch size ({batch_per_device}) must be divisible by iwae_k ({iwae_k}).")
+        
+        # --- LEARNING RATE SCHEDULER & WEIGHT DECAY ---
+        # Dedicate the first 10% of training steps to warming up safely
+        warmup_steps = max(1, int(num_steps * 0.10))
+        
+        schedule = optax.warmup_cosine_decay_schedule(
+            init_value=learning_rate * 0.01,  # Start at 1% of the target learning rate
+            peak_value=learning_rate,         # The target learning rate Optuna suggests
+            warmup_steps=warmup_steps,
+            decay_steps=num_steps,
+            end_value=learning_rate * 0.01    # Decay back down to 1% by the final step
+        )
+        
+        # --- GRADIENT CLIPPING ---
+        # Chain global norm clipping with AdamW to prevent tail-sample gradient explosions
+        optimizer = optax.chain(
+            optax.clip_by_global_norm(1.0),
+            optax.adamw(learning_rate=schedule, weight_decay=weight_decay)
+        )
         opt_state = optimizer.init(eqx.filter(self.flow, eqx.is_inexact_array))
 
         # Define the distributed training step
         # We use pmap to shard the batch, calculate local gradients, and synchronize them via pmean
         @eqx.filter_pmap(axis_name="device")
         def pmap_train_step(flow_shard, opt_state_shard, device_key):
-            # Compute loss and gradients on this specific device
-            loss_val, grads = compute_loss(flow_shard, self.transpiler, device_key, batch_per_device)
+            # Compute loss and gradients on this specific device, passing down the iwae_k parameter
+            loss_val, grads = compute_loss(flow_shard, self.transpiler, device_key, batch_per_device, iwae_k)
             
             # Average the gradients and the loss across all hardware devices
             grads = jax.lax.pmean(grads, axis_name="device")
@@ -399,7 +431,18 @@ class IAFOptimizer:
             if step % max(1, (num_steps // 10)) == 0:
                 # Pull the synchronized loss back to the host CPU for printing
                 current_loss = loss_array[0].item()
-                print(f"Step {step:04d} | Negative ELBO Loss: {current_loss:.4f}")
+                print(f"Step {step:04d} | Negative {'IWAE' if iwae_k > 1 else 'ELBO'} Loss: {current_loss:.4f}")
+                
+                # --- OPTUNA INTEGRATION HOOK ---
+                if callback is not None:
+                    # Pass the step and loss to Optuna. 
+                    # If Optuna says prune, we break the loop.
+                    if callback(step, current_loss):
+                        print(f"Trial pruned at step {step}.")
+                        break
+        
+        # Save the final loss as an attribute so Optuna can retrieve it
+        self.final_loss = loss_array[0].item()
 
         # Collapse the replicated model back to the primary device
         self.flow = tree_map(lambda x: x[0], replicated_flow)
@@ -498,15 +541,13 @@ class IAFOptimizer:
         
         return summary_df
     
-import equinox as eqx
+    def save(self, path: str):
+        """Saves the trained flow parameters to a file."""
+        eqx.tree_serialise_leaves(path, self.flow)
+        print(f"Model saved to {path}")
 
-def save(self, path: str):
-    """Saves the trained flow parameters to a file."""
-    eqx.tree_serialise_leaves(path, self.flow)
-    print(f"Model saved to {path}")
-
-def load(self, path: str):
-    """Loads the flow parameters from a file."""
-    # This assumes self.flow is already initialized with the same architecture
-    self.flow = eqx.tree_deserialise_leaves(path, self.flow)
-    print(f"Model loaded from {path}")
+    def load(self, path: str):
+        """Loads the flow parameters from a file."""
+        # This assumes self.flow is already initialized with the same architecture
+        self.flow = eqx.tree_deserialise_leaves(path, self.flow)
+        print(f"Model loaded from {path}")
